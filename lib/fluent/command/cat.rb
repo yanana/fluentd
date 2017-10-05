@@ -19,81 +19,156 @@ require 'fluent/env'
 require 'fluent/time'
 require 'fluent/msgpack_factory'
 
-op = OptionParser.new
 
-op.banner += " <tag>"
-
-port = 24224
-host = '127.0.0.1'
-unix = false
-socket_path = Fluent::DEFAULT_SOCKET_PATH
-
-config_path = Fluent::DEFAULT_CONFIG_PATH
-format = 'json'
-message_key = 'message'
-time_as_integer = false
-
-op.on('-p', '--port PORT', "fluent tcp port (default: #{port})", Integer) {|i|
-  port = i
-}
-
-op.on('-h', '--host HOST', "fluent host (default: #{host})") {|s|
-  host = s
-}
-
-op.on('-u', '--unix', "use unix socket instead of tcp", TrueClass) {|b|
-  unix = b
-}
-
-op.on('-s', '--socket PATH', "unix socket path (default: #{socket_path})") {|s|
-  socket_path = s
-}
-
-op.on('-f', '--format FORMAT', "input format (default: #{format})") {|s|
-  format = s
-}
-
-op.on('--json', "same as: -f json", TrueClass) {|b|
-  format = 'json'
-}
-
-op.on('--msgpack', "same as: -f msgpack", TrueClass) {|b|
-  format = 'msgpack'
-}
-
-op.on('--none', "same as: -f none", TrueClass) {|b|
-  format = 'none'
-}
-
-op.on('--message-key KEY', "key field for none format (default: #{message_key})") {|s|
-  message_key = s
-}
-
-op.on('--time-as-integer', "Send time as integer for v0.12 or earlier", TrueClass) { |b|
-  time_as_integer = true
-}
-
-(class << self; self; end).module_eval do
-  define_method(:usage) do |msg|
-    puts op.to_s
-    puts "error: #{msg}" if msg
-    exit 1
-  end
-end
-
-begin
-  op.parse!(ARGV)
-
-  if ARGV.length != 1
-    usage nil
+class CatCommand
+  (class << self; self; end).module_eval do
+    define_method(:usage) do |msg|
+      puts op.to_s
+      puts "error: #{msg}" if msg
+      exit 1
+    end
   end
 
-  tag = ARGV.shift
+  attr_reader :format
 
-rescue
-  usage $!.to_s
+  def initialize(argv = ARGV)
+    @argv = argv
+    @port = 24224
+    @host = '127.0.0.1'
+    @unix = false
+    @socket_path = Fluent::DEFAULT_SOCKET_PATH
+    @config_path = Fluent::DEFAULT_CONFIG_PATH
+    @format = 'json'
+    @message_key = 'message'
+    @time_as_integer = false
+    parse_options(argv)
+  end
+
+  def parse_options(argv)
+    op = OptionParser.new
+    op.banner += " <tag>"
+    op.on('-p', '--port PORT', "fluent tcp port (default: #{@port})", Integer) {|i|
+      @port = i
+    }
+
+    op.on('-h', '--host HOST', "fluent host (default: #{@host})") {|s|
+      @host = s
+    }
+
+    op.on('-u', '--unix', "use unix socket instead of tcp", TrueClass) {|b|
+      @unix = b
+    }
+
+    op.on('-s', '--socket PATH', "unix socket path (default: #{@socket_path})") {|s|
+      @socket_path = s
+    }
+
+    op.on('-f', '--format FORMAT', "input format (default: #{@format})") {|s|
+      @format = s
+    }
+
+    op.on('--json', "same as: -f json", TrueClass) {|b|
+      @format = 'json'
+    }
+
+    op.on('--msgpack', "same as: -f msgpack", TrueClass) {|b|
+      @format = 'msgpack'
+    }
+
+    op.on('--none', "same as: -f none", TrueClass) {|b|
+      @format = 'none'
+    }
+
+    op.on('--message-key KEY', "key field for none format (default: #{@message_key})") {|s|
+      @message_key = s
+    }
+
+    op.on('--time-as-integer', "Send time as integer for v0.12 or earlier", TrueClass) { |b|
+      @time_as_integer = true
+    }
+
+    op.on('--use-embedded-time', "Send time using the value in a record", TrueClass) {|b|
+      @use_embedded_time = b
+    }
+
+    (class << self; self; end).module_eval do
+      define_method(:usage) do |msg|
+        puts op.to_s
+        puts "error: #{msg}" if msg
+        exit 1
+      end
+    end
+
+    begin
+      op.parse!(argv)
+
+      if argv.length != 1
+        usage nil
+      end
+
+      @tag = argv.shift
+    rescue
+      usage $!.to_s
+    end
+  end
+
+  def run
+    if @unix
+      connector = Proc.new {
+        UNIXSocket.open(@socket_path)
+      }
+    else
+      connector = Proc.new {
+        TCPSocket.new(@host, @port)
+      }
+    end
+
+    w = Writer.new(@tag, connector, time_as_integer: @time_as_integer, use_embedded_time: @use_embedded_time)
+    w.start
+
+    case @format
+    when 'json'
+      begin
+        while line = $stdin.gets
+          record = Yajl.load(line)
+          w.write(record)
+        end
+      rescue
+        $stderr.puts $!
+        exit 1
+      end
+
+    when 'msgpack'
+      require 'fluent/engine'
+
+      begin
+        u = Fluent::Engine.msgpack_factory.unpacker($stdin)
+        u.each {|record|
+          w.write(record)
+        }
+      rescue EOFError
+      rescue
+        $stderr.puts $!
+        exit 1
+      end
+
+    when 'none'
+      begin
+        while line = $stdin.gets
+          record = { @message_key => line.chomp }
+          w.write(record)
+        end
+      rescue
+        $stderr.puts $!
+        exit 1
+      end
+
+    else
+      $stderr.puts "Unknown format '#{@format}'"
+      exit 1
+    end
+  end
 end
-
 
 require 'thread'
 require 'monitor'
@@ -128,7 +203,7 @@ class Writer
     end
   end
 
-  def initialize(tag, connector, time_as_integer: false)
+  def initialize(tag, connector, time_as_integer: false, use_embedded_time: false)
     @tag = tag
     @connector = connector
     @socket = false
@@ -142,6 +217,7 @@ class Writer
     @retry_wait = 1
     @retry_limit = 5  # TODO
     @time_as_integer = time_as_integer
+    @use_embedded_time = use_embedded_time
 
     super()
   end
@@ -151,8 +227,12 @@ class Writer
       raise ArgumentError, "Input must be a map (got #{record.class})"
     end
 
-    time = Fluent::EventTime.now
-    time = time.to_i if @time_as_integer
+    if @use_embedded_time && record['time']
+      time = record['time']
+    else
+      time = Fluent::EventTime.now
+      time = time.to_i if @time_as_integer
+    end
     entry = [time, record]
     synchronize {
       unless write_impl([entry])
@@ -271,60 +351,3 @@ class Writer
     $stdout.puts "!#{time}:#{Yajl.dump(record)}"
   end
 end
-
-
-if unix
-  connector = Proc.new {
-    UNIXSocket.open(socket_path)
-  }
-else
-  connector = Proc.new {
-    TCPSocket.new(host, port)
-  }
-end
-
-w = Writer.new(tag, connector, time_as_integer: time_as_integer)
-w.start
-
-case format
-when 'json'
-  begin
-    while line = $stdin.gets
-      record = Yajl.load(line)
-      w.write(record)
-    end
-  rescue
-    $stderr.puts $!
-    exit 1
-  end
-
-when 'msgpack'
-  require 'fluent/engine'
-
-  begin
-    u = Fluent::Engine.msgpack_factory.unpacker($stdin)
-    u.each {|record|
-      w.write(record)
-    }
-  rescue EOFError
-  rescue
-    $stderr.puts $!
-    exit 1
-  end
-
-when 'none'
-  begin
-    while line = $stdin.gets
-      record = { message_key => line.chomp }
-      w.write(record)
-    end
-  rescue
-    $stderr.puts $!
-    exit 1
-  end
-
-else
-  $stderr.puts "Unknown format '#{format}'"
-  exit 1
-end
-
